@@ -1,0 +1,85 @@
+name: Project Dashboard
+
+on:
+  schedule:
+    - cron: "15 7 * * 0"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  issues: read
+  pull-requests: read
+  security-events: read
+
+concurrency:
+  group: project-dashboard-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  collect-and-publish:
+    name: Collect metrics and publish wiki
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.ref == 'refs/heads/main'
+    env:
+      TARGET_REPOSITORY: ${{ vars.TARGET_REPOSITORY || 'gastownhall/gascity' }}
+      WIKI_REPOSITORY: ${{ vars.WIKI_REPOSITORY || 'gastownhall/gascity' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Checkout target repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ env.TARGET_REPOSITORY }}
+          path: target-repo
+          token: ${{ secrets.METRICS_COLLECTION_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Collect weekly snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.METRICS_COLLECTION_TOKEN || github.token }}
+        run: >
+          python3 scripts/project_dashboard.py collect
+          --repo "$TARGET_REPOSITORY"
+          --repo-root target-repo
+          --snapshot-file data/gascity/snapshots.jsonl
+          --output dashboard/Project-Dashboard.md
+
+      - name: Commit dashboard snapshot
+        run: |
+          if git diff --quiet -- data/gascity/snapshots.jsonl dashboard/Project-Dashboard.md; then
+            echo "Dashboard snapshot is unchanged."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/gascity/snapshots.jsonl dashboard/Project-Dashboard.md
+          git commit -m "chore: update project dashboard metrics [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Publish wiki dashboard
+        env:
+          GH_TOKEN: ${{ secrets.METRICS_WIKI_TOKEN || secrets.METRICS_COLLECTION_TOKEN || github.token }}
+        run: |
+          wiki_dir="$(mktemp -d)"
+          gh auth setup-git
+          git clone "https://github.com/${WIKI_REPOSITORY}.wiki.git" "$wiki_dir"
+
+          cp -f dashboard/Project-Dashboard.md "$wiki_dir/Project-Dashboard.md"
+          cd "$wiki_dir"
+          if git diff --quiet -- Project-Dashboard.md; then
+            echo "Wiki dashboard is unchanged."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Project-Dashboard.md
+          git commit -m "Update project dashboard"
+          wiki_branch="$(git rev-parse --abbrev-ref HEAD)"
+          git push origin "HEAD:${wiki_branch}"
