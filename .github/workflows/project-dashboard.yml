@@ -24,6 +24,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     env:
       TARGET_REPOSITORY: ${{ vars.TARGET_REPOSITORY || 'gastownhall/gascity' }}
+      PACKS_REPOSITORY: ${{ vars.PACKS_REPOSITORY || 'gastownhall/gascity-packs' }}
       WIKI_REPOSITORY: ${{ vars.WIKI_REPOSITORY || 'gastownhall/gascity' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -38,6 +39,14 @@ jobs:
           token: ${{ secrets.METRICS_COLLECTION_TOKEN || github.token }}
           persist-credentials: false
 
+      - name: Checkout packs repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ env.PACKS_REPOSITORY }}
+          path: packs-repo
+          token: ${{ secrets.METRICS_COLLECTION_TOKEN || github.token }}
+          persist-credentials: false
+
       - name: Collect weekly snapshot
         env:
           GITHUB_TOKEN: ${{ secrets.METRICS_COLLECTION_TOKEN || github.token }}
@@ -45,6 +54,7 @@ jobs:
           python3 scripts/project_dashboard.py collect
           --repo "$TARGET_REPOSITORY"
           --repo-root target-repo
+          --packs-repo-root packs-repo
           --snapshot-file data/gascity/snapshots.jsonl
           --output dashboard/Project-Dashboard.md
 

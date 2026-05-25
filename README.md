@@ -22,14 +22,16 @@ https://github.com/gastownhall/gascity/wiki/Project-Dashboard
 
 ## Configuration
 
-The workflow defaults to collecting `gastownhall/gascity` and publishing to the
-`gastownhall/gascity` wiki.
+The workflow defaults to collecting `gastownhall/gascity`, reading pack data
+from `gastownhall/gascity-packs`, and publishing to the `gastownhall/gascity`
+wiki.
 
 Optional repository variables:
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `TARGET_REPOSITORY` | `gastownhall/gascity` | Repository to collect metrics for. |
+| `PACKS_REPOSITORY` | `gastownhall/gascity-packs` | Repository used as the source for example-pack counts. |
 | `WIKI_REPOSITORY` | `gastownhall/gascity` | Repository whose wiki receives `Project-Dashboard.md`. |
 
 Recommended secrets:
@@ -55,6 +57,7 @@ Collect a live snapshot:
 GITHUB_TOKEN="$(gh auth token)" python3 scripts/project_dashboard.py collect \
   --repo gastownhall/gascity \
   --repo-root /path/to/gascity \
+  --packs-repo-root /path/to/gascity-packs \
   --snapshot-file data/gascity/snapshots.jsonl \
   --output dashboard/Project-Dashboard.md
 ```

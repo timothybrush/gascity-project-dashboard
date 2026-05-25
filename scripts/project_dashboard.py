@@ -49,8 +49,10 @@ COLLECTED_METRIC_KEYS = (
     "latest_release_age_days",
     "community_profile_score",
     "ci_success_rate_7d",
-    "ci_completed_runs_7d",
-    "ci_median_duration_minutes_7d",
+    "ci_main_commits_checked_7d",
+    "ci_main_failed_commits_7d",
+    "ci_main_median_duration_minutes_7d",
+    "ci_main_p90_duration_minutes_7d",
     "ttfr_median_hours_30d",
     "ttfr_sample_size_30d",
     "external_contribution_share_30d",
@@ -74,8 +76,6 @@ COLLECTED_METRIC_KEYS = (
     "dependabot_alerts_open",
     "code_scanning_alerts_open",
     "pack_count",
-    "formula_count",
-    "pack_changes_7d",
     "tutorial_doc_count",
     "quickstart_docs_present",
     "installation_docs_present",
@@ -138,18 +138,28 @@ METRIC_DEFINITIONS = {
     ),
     "ci_success_rate_7d": (
         "CI success rate, 7d",
-        "The percentage of completed GitHub Actions workflow runs in the last seven days that concluded successfully.",
-        "Reads completed runs from `GET /repos/{owner}/{repo}/actions/runs` and divides successful runs by completed runs.",
+        "The percentage of main-branch commits whose latest CI workflow run in the last seven days concluded successfully.",
+        "Finds the `CI` workflow, reads completed main-branch runs from `GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs`, groups by commit SHA, and divides successful commit results by checked commits.",
     ),
-    "ci_completed_runs_7d": (
-        "Completed workflow runs, 7d",
-        "The number of completed GitHub Actions workflow runs sampled in the last seven days.",
-        "Counts completed runs returned by `GET /repos/{owner}/{repo}/actions/runs` with a seven-day created filter.",
+    "ci_main_commits_checked_7d": (
+        "Main CI commits checked, 7d",
+        "The number of distinct main-branch commits with a completed CI workflow result in the last seven days.",
+        "Counts unique `head_sha` values from completed `CI` workflow runs on the `main` branch.",
     ),
-    "ci_median_duration_minutes_7d": (
-        "Median workflow duration, 7d",
-        "The median elapsed time in minutes for completed workflow runs in the last seven days.",
-        "Computes the median of `updated_at - run_started_at` for completed GitHub Actions runs.",
+    "ci_main_failed_commits_7d": (
+        "Main CI failed commits, 7d",
+        "The number of distinct main-branch commits whose latest completed CI workflow result was not successful.",
+        "Groups completed `CI` workflow runs by commit SHA and counts latest conclusions other than `success`.",
+    ),
+    "ci_main_median_duration_minutes_7d": (
+        "Main CI median duration, 7d",
+        "The median elapsed runtime in minutes for the latest completed CI run per main-branch commit.",
+        "Computes the median of `updated_at - run_started_at` for latest per-commit `CI` workflow runs on `main`.",
+    ),
+    "ci_main_p90_duration_minutes_7d": (
+        "Main CI p90 duration, 7d",
+        "The 90th percentile elapsed runtime in minutes for latest completed CI runs per main-branch commit.",
+        "Computes the p90 of `updated_at - run_started_at` for latest per-commit `CI` workflow runs on `main`.",
     ),
     "ttfr_median_hours_30d": (
         "Median first human response, 30d",
@@ -263,18 +273,8 @@ METRIC_DEFINITIONS = {
     ),
     "pack_count": (
         "Example packs",
-        "The number of `pack.toml` files in the target repository's `examples` tree.",
-        "Counts `examples/**/pack.toml` in a checked-out copy of the target repository.",
-    ),
-    "formula_count": (
-        "Example formulas",
-        "The number of `.formula.toml` files in the target repository's `examples` tree.",
-        "Counts `examples/**/*.formula.toml` in a checked-out copy of the target repository.",
-    ),
-    "pack_changes_7d": (
-        "Example/pack commits, 7d",
-        "The number of commits touching the target repository's `examples` path in the last seven days.",
-        "Counts commits returned by the GitHub commits API with `path=examples` and a seven-day `since` filter.",
+        "The number of public example/configuration packs currently published in `gastownhall/gascity-packs`.",
+        "Counts `**/pack.toml` files in a checked-out copy of the `gascity-packs` repository.",
     ),
     "tutorial_doc_count": (
         "Tutorial docs",
@@ -313,6 +313,21 @@ def median(values: list[float]) -> float | None:
     if not values:
         return None
     return round(float(statistics.median(values)), 2)
+
+
+def percentile(values: list[float], percentile_value: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return round(float(ordered[0]), 2)
+    rank = (len(ordered) - 1) * percentile_value
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return round(float(ordered[int(rank)]), 2)
+    weight = rank - lower
+    return round(float(ordered[lower] * (1 - weight) + ordered[upper] * weight), 2)
 
 
 def percentage(numerator: int, denominator: int) -> float | None:
@@ -497,20 +512,22 @@ def search_items(
     return items
 
 
+def workflow_id_for(client: GitHubClient, repo: str, workflow_name: str) -> int | None:
+    workflows = client.paginate(f"/repos/{repo}/actions/workflows", {"per_page": 100})
+    for page in workflows:
+        for workflow in page.get("workflows", []) if isinstance(page, dict) else []:
+            if workflow.get("name") == workflow_name or workflow.get("path", "").endswith(workflow_name):
+                workflow_id = workflow.get("id")
+                return int(workflow_id) if workflow_id is not None else None
+    return None
+
+
 def latest_workflow_status(
     client: GitHubClient,
     repo: str,
     workflow_name: str,
 ) -> dict[str, Any]:
-    workflows = client.paginate(f"/repos/{repo}/actions/workflows", {"per_page": 100})
-    workflow_id = None
-    for page in workflows:
-        for workflow in page.get("workflows", []) if isinstance(page, dict) else []:
-            if workflow.get("name") == workflow_name or workflow.get("path", "").endswith(workflow_name):
-                workflow_id = workflow.get("id")
-                break
-        if workflow_id:
-            break
+    workflow_id = workflow_id_for(client, repo, workflow_name)
     if not workflow_id:
         return {"workflow": workflow_name, "conclusion": None, "updated_at": None}
     runs = client.request_json(
@@ -530,31 +547,79 @@ def latest_workflow_status(
 
 
 def collect_workflow_metrics(client: GitHubClient, repo: str, since: str) -> dict[str, Any]:
-    runs = client.paginate(
-        f"/repos/{repo}/actions/runs",
-        {
-            "created": f">={since}",
-            "status": "completed",
-            "per_page": 100,
-        },
-        max_pages=5,
-        optional=True,
-    )
+    workflow_id = workflow_id_for(client, repo, "CI")
     completed: list[dict[str, Any]] = []
-    for page in runs:
-        if isinstance(page, dict):
-            completed.extend(page.get("workflow_runs", []))
-    successful = [run for run in completed if run.get("conclusion") == "success"]
-    durations: list[float] = []
+    if workflow_id:
+        pages = client.paginate(
+            f"/repos/{repo}/actions/workflows/{workflow_id}/runs",
+            {
+                "branch": "main",
+                "created": f">={since}",
+                "status": "completed",
+                "per_page": 100,
+            },
+            max_pages=3,
+            optional=True,
+        )
+        for page in pages:
+            if isinstance(page, dict):
+                completed.extend(page.get("workflow_runs", []))
+
+    latest_by_commit: dict[str, dict[str, Any]] = {}
     for run in completed:
+        if run.get("head_branch") != "main":
+            continue
+        sha = run.get("head_sha")
+        if not sha:
+            continue
+        current_time = parse_time(run.get("run_started_at") or run.get("created_at")) or dt.datetime.min.replace(
+            tzinfo=dt.timezone.utc
+        )
+        previous = latest_by_commit.get(sha)
+        previous_time = (
+            parse_time(previous.get("run_started_at") or previous.get("created_at"))
+            if previous
+            else None
+        )
+        if previous is None or previous_time is None or current_time >= previous_time:
+            latest_by_commit[sha] = run
+
+    commit_runs = sorted(
+        latest_by_commit.values(),
+        key=lambda run: parse_time(run.get("run_started_at") or run.get("created_at"))
+        or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        reverse=True,
+    )
+    successful = [run for run in commit_runs if run.get("conclusion") == "success"]
+    durations: list[float] = []
+    recent_runs: list[dict[str, Any]] = []
+    for run in commit_runs:
         started_at = parse_time(run.get("run_started_at") or run.get("created_at"))
         updated_at = parse_time(run.get("updated_at"))
+        duration = None
         if started_at and updated_at and updated_at >= started_at:
-            durations.append((updated_at - started_at).total_seconds() / 60)
+            duration = round((updated_at - started_at).total_seconds() / 60, 2)
+            durations.append(duration)
+        if len(recent_runs) < 10:
+            sha = str(run.get("head_sha") or "")
+            recent_runs.append(
+                {
+                    "sha": sha,
+                    "sha_short": sha[:8],
+                    "conclusion": run.get("conclusion") or run.get("status"),
+                    "duration_minutes": duration,
+                    "run_started_at": run.get("run_started_at") or run.get("created_at"),
+                    "updated_at": run.get("updated_at"),
+                    "html_url": run.get("html_url"),
+                }
+            )
     return {
-        "ci_completed_runs_7d": len(completed),
-        "ci_success_rate_7d": percentage(len(successful), len(completed)),
-        "ci_median_duration_minutes_7d": median(durations),
+        "ci_success_rate_7d": percentage(len(successful), len(commit_runs)),
+        "ci_main_commits_checked_7d": len(commit_runs),
+        "ci_main_failed_commits_7d": len(commit_runs) - len(successful),
+        "ci_main_median_duration_minutes_7d": median(durations),
+        "ci_main_p90_duration_minutes_7d": percentile(durations, 0.9),
+        "ci_main_recent_runs": recent_runs,
         "workflow_latest": [
             latest_workflow_status(client, repo, "CI"),
             latest_workflow_status(client, repo, "Nightly"),
@@ -771,22 +836,28 @@ def collect_security_metrics(client: GitHubClient, repo: str) -> dict[str, Any]:
     }
 
 
-def collect_local_metrics(repo_root: Path) -> dict[str, Any]:
-    pack_files = sorted(repo_root.glob("examples/**/pack.toml"))
-    formula_files = sorted(repo_root.glob("examples/**/*.formula.toml"))
+def collect_local_metrics(repo_root: Path, packs_repo_root: Path) -> dict[str, Any]:
+    pack_files = sorted(
+        path for path in packs_repo_root.rglob("pack.toml") if ".git" not in path.parts
+    )
     tutorial_files = sorted((repo_root / "docs" / "tutorials").glob("*.md"))
     quickstart = repo_root / "docs" / "getting-started" / "quickstart.md"
     installation = repo_root / "docs" / "getting-started" / "installation.md"
     return {
         "pack_count": len(pack_files),
-        "formula_count": len(formula_files),
         "tutorial_doc_count": len(tutorial_files),
         "quickstart_docs_present": quickstart.exists(),
         "installation_docs_present": installation.exists(),
     }
 
 
-def collect_snapshot(repo: str, repo_root: Path, token: str, now: dt.datetime | None = None) -> dict[str, Any]:
+def collect_snapshot(
+    repo: str,
+    repo_root: Path,
+    packs_repo_root: Path,
+    token: str,
+    now: dt.datetime | None = None,
+) -> dict[str, Any]:
     now = now or utcnow()
     client = GitHubClient(token)
     since_7 = iso_date(WINDOW_DAYS, now)
@@ -807,7 +878,7 @@ def collect_snapshot(repo: str, repo_root: Path, token: str, now: dt.datetime | 
     issue_category_metrics = collect_issue_category_metrics(client, repo, since_30)
     release_metrics = collect_release_metrics(client, repo, now)
     security_metrics = collect_security_metrics(client, repo)
-    local_metrics = collect_local_metrics(repo_root)
+    local_metrics = collect_local_metrics(repo_root, packs_repo_root)
 
     metrics: dict[str, dict[str, Any]] = {
         "github_stars": metric(repo_payload.get("stargazers_count"), "count", "GitHub repository API"),
@@ -821,9 +892,11 @@ def collect_snapshot(repo: str, repo_root: Path, token: str, now: dt.datetime | 
         "latest_release_downloads": metric(release_metrics["latest_release_downloads"], "downloads", "GitHub releases API"),
         "latest_release_age_days": metric(release_metrics["latest_release_age_days"], "days", "GitHub releases API"),
         "community_profile_score": metric(profile.get("health_percentage"), "percent", "GitHub community profile API"),
-        "ci_success_rate_7d": metric(workflow_metrics["ci_success_rate_7d"], "percent", "GitHub Actions API"),
-        "ci_completed_runs_7d": metric(workflow_metrics["ci_completed_runs_7d"], "runs", "GitHub Actions API"),
-        "ci_median_duration_minutes_7d": metric(workflow_metrics["ci_median_duration_minutes_7d"], "minutes", "GitHub Actions API"),
+        "ci_success_rate_7d": metric(workflow_metrics["ci_success_rate_7d"], "percent", "GitHub Actions CI workflow on main"),
+        "ci_main_commits_checked_7d": metric(workflow_metrics["ci_main_commits_checked_7d"], "commits", "GitHub Actions CI workflow on main"),
+        "ci_main_failed_commits_7d": metric(workflow_metrics["ci_main_failed_commits_7d"], "commits", "GitHub Actions CI workflow on main"),
+        "ci_main_median_duration_minutes_7d": metric(workflow_metrics["ci_main_median_duration_minutes_7d"], "minutes", "GitHub Actions CI workflow on main"),
+        "ci_main_p90_duration_minutes_7d": metric(workflow_metrics["ci_main_p90_duration_minutes_7d"], "minutes", "GitHub Actions CI workflow on main"),
         "ttfr_median_hours_30d": metric(community_metrics["ttfr_median_hours_30d"], "hours", "GitHub issues and PR APIs"),
         "ttfr_sample_size_30d": metric(community_metrics["ttfr_sample_size_30d"], "items", "GitHub issues and PR APIs"),
         "external_contribution_share_30d": metric(community_metrics["external_contribution_share_30d"], "percent", "GitHub PR API"),
@@ -846,9 +919,7 @@ def collect_snapshot(repo: str, repo_root: Path, token: str, now: dt.datetime | 
         "regression_issues_created_30d": metric(issue_category_metrics["regression_issues_created_30d"], "issues", "GitHub issues API"),
         "dependabot_alerts_open": metric(security_metrics["dependabot_alerts_open"], "alerts", "Dependabot alerts API"),
         "code_scanning_alerts_open": metric(security_metrics["code_scanning_alerts_open"], "alerts", "Code scanning alerts API"),
-        "pack_count": metric(local_metrics["pack_count"], "packs", "repository checkout"),
-        "formula_count": metric(local_metrics["formula_count"], "formulas", "repository checkout"),
-        "pack_changes_7d": metric(len(client.paginate(f"/repos/{repo}/commits", {"path": "examples", "since": f"{since_7}T00:00:00Z", "per_page": 100}, optional=True)), "commits", "GitHub commits API"),
+        "pack_count": metric(local_metrics["pack_count"], "packs", "gascity-packs repository checkout"),
         "tutorial_doc_count": metric(local_metrics["tutorial_doc_count"], "docs", "repository checkout"),
         "quickstart_docs_present": metric(local_metrics["quickstart_docs_present"], "boolean", "repository checkout"),
         "installation_docs_present": metric(local_metrics["installation_docs_present"], "boolean", "repository checkout"),
@@ -870,6 +941,7 @@ def collect_snapshot(repo: str, repo_root: Path, token: str, now: dt.datetime | 
             "downloads": release_metrics["latest_release_downloads"],
         },
         "workflow_latest": workflow_metrics["workflow_latest"],
+        "ci_main_recent_runs": workflow_metrics["ci_main_recent_runs"],
         "top_referrers": top_referrers[:10],
         "top_paths": top_paths[:10],
         "metrics": metrics,
@@ -905,9 +977,14 @@ def metric_value(snapshot: dict[str, Any], key: str) -> Any:
 
 
 def value_series(snapshots: list[dict[str, Any]], key: str, limit: int = 8) -> list[Any]:
+    latest_metric = snapshots[-1].get("metrics", {}).get(key) or {}
+    latest_source = latest_metric.get("source")
     values = []
     for snapshot in snapshots[-limit:]:
-        values.append(metric_value(snapshot, key))
+        metric_payload = snapshot.get("metrics", {}).get(key) or {}
+        if latest_source and metric_payload.get("source") != latest_source:
+            continue
+        values.append(metric_payload.get("value"))
     return values
 
 
@@ -990,6 +1067,24 @@ def render_workflows(snapshot: dict[str, Any]) -> list[str]:
         if url:
             conclusion = f"[{conclusion}]({url})"
         lines.append(f"| {name} | {conclusion} | {updated} |")
+    return lines
+
+
+def render_ci_runs(snapshot: dict[str, Any]) -> list[str]:
+    runs = snapshot.get("ci_main_recent_runs", [])
+    if not runs:
+        return ["No main-branch CI run data available."]
+    lines = ["| Commit | Result | Duration | Completed |", "|---|---|---:|---|"]
+    for run in runs[:8]:
+        sha = run.get("sha_short") or str(run.get("sha") or "")[:8] or "unknown"
+        url = run.get("html_url")
+        commit_text = f"[`{sha}`]({url})" if url else f"`{sha}`"
+        duration = human_number(run.get("duration_minutes"))
+        if run.get("duration_minutes") is not None:
+            duration = f"{duration} min"
+        lines.append(
+            f"| {commit_text} | {run.get('conclusion') or 'n/a'} | {duration} | {run.get('updated_at') or 'n/a'} |"
+        )
     return lines
 
 
@@ -1095,8 +1190,10 @@ def render_dashboard(snapshots: list[dict[str, Any]]) -> str:
         render_metric_table(
             snapshots,
             [
-                ("ci_completed_runs_7d", "Completed workflow runs, 7d"),
-                ("ci_median_duration_minutes_7d", "Median workflow duration, 7d"),
+                ("ci_main_commits_checked_7d", "Main CI commits checked, 7d"),
+                ("ci_main_failed_commits_7d", "Main CI failed commits, 7d"),
+                ("ci_main_median_duration_minutes_7d", "Main CI median duration, 7d"),
+                ("ci_main_p90_duration_minutes_7d", "Main CI p90 duration, 7d"),
                 ("quickstart_docs_present", "Quickstart docs present"),
                 ("installation_docs_present", "Installation docs present"),
                 ("tutorial_doc_count", "Tutorial docs"),
@@ -1105,6 +1202,8 @@ def render_dashboard(snapshots: list[dict[str, Any]]) -> str:
     )
     lines.extend(["", "### Latest Workflow Status", ""])
     lines.extend(render_workflows(latest))
+    lines.extend(["", "### Recent Main CI Results", ""])
+    lines.extend(render_ci_runs(latest))
     lines.extend(["", "## Community", ""])
     lines.extend(
         render_metric_table(
@@ -1143,8 +1242,6 @@ def render_dashboard(snapshots: list[dict[str, Any]]) -> str:
             snapshots,
             [
                 ("pack_count", "Example packs"),
-                ("formula_count", "Example formulas"),
-                ("pack_changes_7d", "Example/pack commits, 7d"),
             ],
         )
     )
@@ -1174,8 +1271,9 @@ def render_dashboard(snapshots: list[dict[str, Any]]) -> str:
 def collect_command(args: argparse.Namespace) -> int:
     snapshot_path = Path(args.snapshot_file)
     repo_root = Path(args.repo_root)
+    packs_repo_root = Path(args.packs_repo_root)
     token = os.environ.get("GITHUB_TOKEN", "")
-    snapshot = collect_snapshot(args.repo, repo_root, token)
+    snapshot = collect_snapshot(args.repo, repo_root, packs_repo_root, token)
     snapshots = upsert_snapshot(load_snapshots(snapshot_path), snapshot)
     write_snapshots(snapshot_path, snapshots)
     if args.output:
@@ -1200,6 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("TARGET_REPOSITORY", os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO)),
     )
     collect.add_argument("--repo-root", default=".")
+    collect.add_argument("--packs-repo-root", default=os.environ.get("PACKS_REPO_ROOT", "."))
     collect.add_argument("--snapshot-file", required=True)
     collect.add_argument("--output")
     collect.set_defaults(func=collect_command)
